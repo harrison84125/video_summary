@@ -1,26 +1,41 @@
 import requests
-import urllib.parse
-from Crypto.Cipher import AES
 import os
 import subprocess
+from Crypto.Cipher import AES
 
-# Function to download the .ts files
-def download_ts_files(base_url, headers, cookies, start_number, end_number):
-    for number in range(start_number, end_number + 1):
-        ts_url = f"{base_url}{number}.ts"
-        response = requests.get(ts_url, headers=headers, cookies=cookies)
-        
-        if response.status_code == 200:
-            with open(f"video_{number}.ts", "wb") as f:
-                f.write(response.content)
-            print(f"Downloaded segment {number} successfully.")
-        else:
-            print(f"Failed to download segment {number}. Status code: {response.status_code}")
+
+# Function to download the .m3u8 playlist
+def download_m3u8(m3u8_url, headers, cookies):
+    response = requests.get(m3u8_url, headers=headers, cookies=cookies)
+    if response.status_code == 200:
+        with open("playlist.m3u8", "wb") as f:
+            f.write(response.content)
+        print("Downloaded .m3u8 playlist successfully.")
+    else:
+        print(f"Failed to download .m3u8 playlist. Status code: {response.status_code}")
+
+
+# Function to parse the .m3u8 file and extract key, IV, and segment files
+def parse_m3u8(base_url):
+    segments = []
+    key_url = None
+    iv = None
+    with open("playlist.m3u8", "r") as f:
+        for line in f:
+            if line.startswith("#EXT-X-KEY"):
+                key_uri = line.split("URI=")[1].split(",")[0].replace('"', "")
+                key_url = base_url + key_uri  # Prepend the base URL to the key URI
+                iv = line.split("IV=")[1].strip()
+            elif line.endswith(".ts\n"):
+                segments.append(
+                    base_url + line.strip()
+                )  # Prepend the base URL to the .ts segments
+    return key_url, iv, segments
+
 
 # Function to download the AES decryption key
 def download_key(key_url, headers, cookies, key_file):
     response = requests.get(key_url, headers=headers, cookies=cookies)
-    
     if response.status_code == 200:
         with open(key_file, "wb") as f:
             f.write(response.content)
@@ -28,56 +43,64 @@ def download_key(key_url, headers, cookies, key_file):
     else:
         print(f"Failed to download key. Status code: {response.status_code}")
 
+
 # Function to read the AES key from the file
 def read_key_from_file(key_file):
-    with open(key_file, 'rb') as f:
+    with open(key_file, "rb") as f:
         key = f.read(16)  # AES-128 uses a 16-byte key
     return key
 
-# Function to decrypt the .ts files
-def decrypt_ts_files(start_number, end_number, key):
-    for i in range(start_number, end_number + 1):
-        input_file = f'video_{i}.ts'
-        output_file = f'decrypted_{i}.ts'
-        
-        if os.path.exists(input_file):
-            iv = bytes.fromhex(f'{i:032x}')  # Derive IV from the segment number
-            decrypt_ts_file(input_file, output_file, key, iv)
+
+# Function to download and decrypt the .ts files
+def download_and_decrypt_ts_files(segments, key, iv, headers, cookies):
+    iv_bytes = bytes.fromhex(
+        iv[2:]
+    )  # Convert IV from hex to bytes (removing the '0x' prefix)
+
+    for i, segment in enumerate(segments):
+        response = requests.get(segment, headers=headers, cookies=cookies)
+
+        if response.status_code == 200:
+            encrypted_ts = response.content
+            output_file = f"decrypted_{i}.ts"
+
+            # Decrypt the .ts file
+            cipher = AES.new(key, AES.MODE_CBC, iv_bytes)
+            decrypted_ts = cipher.decrypt(encrypted_ts)
+
+            with open(output_file, "wb") as f_out:
+                f_out.write(decrypted_ts)
+            print(f"Decrypted {segment} to {output_file}")
         else:
-            print(f"{input_file} does not exist.")
+            print(
+                f"Failed to download segment {segment}. Status code: {response.status_code}"
+            )
 
-# Function to decrypt a single .ts file
-def decrypt_ts_file(input_file, output_file, key, iv):
-    with open(input_file, 'rb') as f_in:
-        encrypted_data = f_in.read()
-
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    decrypted_data = cipher.decrypt(encrypted_data)
-
-    with open(output_file, 'wb') as f_out:
-        f_out.write(decrypted_data)
-
-    print(f"Decrypted {input_file} to {output_file}")
 
 # Function to create a list of decrypted files for FFmpeg
-def generate_file_list(start_number, end_number, file_list):
-    with open(file_list, 'w') as f:
-        for number in range(start_number, end_number + 1):
-            ts_file = f"decrypted_{number}.ts"
+def generate_file_list(segments, file_list):
+    with open(file_list, "w") as f:
+        for i in range(len(segments)):
+            ts_file = f"decrypted_{i}.ts"
             if os.path.exists(ts_file):
                 f.write(f"file '{ts_file}'\n")
             else:
                 print(f"{ts_file} does not exist.")
 
+
 # Function to merge the decrypted .ts files using FFmpeg
 def merge_ts_files(file_list, output_file):
     ffmpeg_command = [
-        'ffmpeg',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', file_list,
-        '-c', 'copy',
-        output_file
+        "ffmpeg",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        file_list,
+        "-c",
+        "copy",
+        output_file,
     ]
     try:
         subprocess.run(ffmpeg_command, check=True)
@@ -85,22 +108,15 @@ def merge_ts_files(file_list, output_file):
     except subprocess.CalledProcessError as e:
         print(f"Error occurred: {e}")
 
-# The main function to orchestrate the entire process
-def main(root_url):
-    base_url = root_url + "_1080p_playList"
-    key_url = root_url + "_1080p.key"
-    key_file = 'decrypt.key'
-    file_list = 'file_list.txt'
-    output_file = 'output_video.mp4'
-    start_number = 0
-    # ! 100 is around 15 minutes of video
-    end_number = 100  # Adjust according to the available playlist segments
-    
-    # The encoded cookie string you provided
-    encoded_cookie = "auth_token_json"
-    decoded_cookie = urllib.parse.unquote(encoded_cookie)
-    
-    # Set the headers and cookies
+
+# Main function to orchestrate the entire process
+def main(m3u8_url):
+
+    base_url = m3u8_url.rsplit("/", 1)[0] + "/"
+    key_file = "decrypt.key"
+    file_list = "file_list.txt"
+    output_file = "output_video.mp4"
+
     headers = {
         "accept": "application/json, text/plain, */*",
         "accept-encoding": "gzip, deflate, br, zstd",
@@ -109,38 +125,40 @@ def main(root_url):
         "dnt": "1",
         "origin": "https://www.example.com",
         "referer": "https://www.example.com/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
     }
-    
+
     cookies = {
         "styleMode": "%22light%22",
         "_ga": "GA1.1.832753514.1681640269",
         "local-cookie-accept": '{"status":true}',
         "isSideClose": "false",
         "confirmAdult": '{"isConfirm":true,"normalDialog18Age":"1927/01/01"}',
-        "auth": decoded_cookie,
-        "_ga_Q4XDSLQE2E": "GS1.1.1728567616.59.1.1728567717.0.0.0"
+        "_ga_Q4XDSLQE2E": "GS1.1.1728567616.59.1.1728567717.0.0.0",
     }
-    
-    # Step 1: Download the .ts files
-    download_ts_files(base_url, headers, cookies, start_number, end_number)
 
-    # Step 2: Download the decryption key
+    # Step 1: Download the .m3u8 playlist
+    download_m3u8(m3u8_url, headers, cookies)
+
+    # Step 2: Parse the .m3u8 file to extract key, IV, and segments
+    key_url, iv, segments = parse_m3u8(base_url)
+
+    # Step 3: Download the decryption key
     download_key(key_url, headers, cookies, key_file)
 
-    # Step 3: Read the decryption key from the file
+    # Step 4: Read the decryption key from the file
     key = read_key_from_file(key_file)
 
-    # Step 4: Decrypt the downloaded .ts files
-    decrypt_ts_files(start_number, end_number, key)
+    # Step 5: Download and decrypt the .ts files
+    download_and_decrypt_ts_files(segments, key, iv, headers, cookies)
 
-    # Step 5: Generate the file list for FFmpeg
-    generate_file_list(start_number, end_number, file_list)
+    # Step 6: Generate the file list for FFmpeg
+    generate_file_list(segments, file_list)
 
-    # Step 6: Merge the decrypted .ts files into an .mp4 file
+    # Step 7: Merge the decrypted .ts files into an .mp4 file
     merge_ts_files(file_list, output_file)
+
 
 # Run the main function when this script is executed
 if __name__ == "__main__":
-    main(root_url = "target_url_here"
-)
+    main()
